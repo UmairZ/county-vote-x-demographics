@@ -1,204 +1,172 @@
-# County Vote × Demographics — Build Guide
+# County Vote × Demographics
 
-> **This is a build guide, not the project README.** You're going to write the
-> pipeline. When it works, replace this file with a real portfolio README —
-> writing that up is part of the exercise.
+A county-level dataset joining MIT Election Lab presidential returns (2000–2024) to Census ACS demographics on 5-digit county FIPS. Built on BigQuery, transformed with dbt, orchestrated with Dagster.
 
----
+The join is straightforward. The part I spent most of the time on is the test around it, which asserts that every election FIPS resolves to a Census county. It currently flags 50 geographies that do not match, all of them real quirks of US geography rather than pipeline bugs.
 
-## What you're building
-
-A cross-matched county-level dataset: **MIT Election Lab presidential returns
-joined to Census ACS demographics on 5-digit county FIPS**, on BigQuery,
-transformed with dbt, orchestrated with Dagster.
-
-The sentence you get to write afterward — and defend in an interview:
-
-> Built a dbt + BigQuery pipeline cross-matching county election returns with
-> Census demographics, orchestrated with Dagster; idempotent incremental loads
-> and dbt tests, including referential checks that flag geographies failing to
-> cross-match.
-
-That covers BigQuery, dbt, Dagster, idempotency, and cross-matching in one line.
-
-**The join is the easy part.** A FIPS join is thirty seconds of SQL. What makes
-this worth building is the *quality gate around* the join — cross-matching
-geographies fails in specific, recurring, boring ways, and the test that names
-them is the thing you'll actually get asked about. Budget your weekend
-accordingly: TODO 5 matters more than TODO 4.
+All data is public and contains no PII.
 
 ---
 
-## Target graph
+## The graph
 
 ```
 Census ACS API ──► raw_census_acs5 ─────► stg_census ────┐
                                                           ├──► county_vote_x_demographics
-Dataverse CSV ───► raw_county_president ─► stg_election ─┘         (incremental MERGE)
+Dataverse CSV ───► raw_county_president ─► stg_election ─┘        (incremental MERGE)
 ```
+
+| Layer | Object | Rows | What it does |
+|---|---|---|---|
+| raw | `raw_county_president` | 94,151 | Copy of the MEDSL CSV |
+| raw | `raw_census_acs5` | 3,222 | Copy of the ACS API response |
+| staging | `stg_election` (view) | 44,164 | Zero-pads FIPS, filters to two-party presidential, collapses vote modes |
+| staging | `stg_census` (view) | 3,222 | Rebuilds FIPS from `state`+`county`, casts estimates, nulls jam values |
+| mart | `county_vote_x_demographics` (table) | 21,743 | The join, plus two-party share and demographic percentages |
+
+Mart grain: one row per county per election year per office.
 
 ---
 
-## What's already done vs. what's yours
+## Notes on the data
 
-| Done for you | Why |
-|---|---|
-| `pyproject.toml`, `uv.lock` | Dependency pinning isn't the lesson. Python is pinned to 3.12 — dbt and Dagster don't support 3.14 yet, which is what your system Python is. |
-| `dbt/dbt_project.yml`, `dbt/profiles.yml` | Boilerplate. Read them anyway — `profiles.yml` pulls the project ID from env vars so no credentials land in git. |
-| `dbt/models/staging/staging.yml` → `sources:` | Wiring. |
-| **`dbt/models/staging/stg_election.sql`** | **Your worked example.** Complete and heavily commented. Read it before writing anything else — it demonstrates the CTE structure, the FIPS padding idiom, and one genuinely nasty grain bug. |
+**50 geographies fail to cross-match.** The `relationships` test flags 678 rows across 50 FIPS codes, written to an audit table by `store_failures: true`.
 
-| Yours | File | Roughly |
+| FIPS | State | Reason |
 |---|---|---|
-| TODO 1 | `pipeline/etl.py` | 1 hr |
-| TODO 2 | *(setup — see below)* | 30 min |
-| TODO 3 | `dbt/models/staging/stg_census.sql` | 45 min |
-| TODO 4 | `dbt/models/marts/county_vote_x_demographics.sql` | 1 hr |
-| **TODO 5** | **`dbt/models/staging/staging.yml`** | **1 hr — the important one** |
-| TODO 6 | `dbt/models/marts/marts.yml` | 20 min |
-| TODO 7 | `dbt/tests/dem_two_party_share_in_range.sql` | 20 min |
-| TODO 8 | `pipeline/definitions.py` | 1–2 hrs (Sunday) |
+| `02001`–`02040` | AK | Returns are reported by state house district under pseudo-FIPS. These overlap numerically with real borough codes (`02013` is a genuine Aleutians East Borough code), so a bad join could produce false matches, not just missing ones. |
+| `09001`–`09015` | CT | All eight counties, every year. Connecticut's counties were replaced by nine planning regions in the 2022+ ACS. The boundaries do not nest. |
+| `29380`, `36000` | MO | Kansas City spans four counties and is reported separately. Its code changed between the 2020 and 2024 vintages. |
+| `46113` | SD | Shannon County became Oglala Lakota County in 2015 and moved to `46102`. The source follows that through 2020, then reverts to `46113` in 2024. |
+| `51515` | VA | Bedford City was dissolved in 2013 and its FIPS retired. Present in returns through 2016, absent from the ACS. |
 
-Every stub carries its spec, its traps, and a verification step inline. Work
-the TODO numbers in order.
+The Oglala Lakota case is why I used a test rather than a static crosswalk: the source's coding changed after any crosswalk would have been written.
+
+**Vote modes double-count if summed naively.** The source uses 20 different `mode` labels, and some states report a `TOTAL` row alongside the per-mode rows that sum to it.
+
+```
+county-year-party groups:
+    TOTAL row only              40,200
+    per-mode rows only           2,450
+    BOTH (double-count risk)     1,514
+```
+
+`SUM(candidatevotes)` doubles the votes in those 1,514 groups without erroring or failing any null or uniqueness check. `stg_election` uses the `TOTAL` row where one exists and sums the modes where it does not.
+
+**ACS uses negative sentinels for suppressed estimates**, not nulls. Two counties out of 3,222 carried `-666666666`, which is enough to move the average county median household income from $65,047 to -$348,815. `stg_census` nulls anything negative, testing the property rather than listing known sentinel codes.
 
 ---
 
-## Setup (TODO 2 — do this first, it has waiting in it)
+## Tests
 
-### 1. Google Cloud, from zero (~15 min)
+Sixteen tests, run interleaved with the models by `dbt build`, so a failure stops its own downstream.
 
-BigQuery's free **sandbox will not work.** It blocks the DML that incremental
-`MERGE` needs, and it fails with a permissions error that never mentions
-billing. Create the project with billing enabled. At this data size (a few MB)
-you stay inside the free tier and pay effectively nothing.
+The cross-match gate:
 
-1. Account at <https://console.cloud.google.com> — new accounts get free credit.
-2. Create a project. Note the **project ID**, not the display name.
-3. Billing → link a billing account **to that project**.
-4. APIs & Services → enable **BigQuery API**.
-5. Install gcloud: <https://cloud.google.com/sdk/docs/install>, then:
-
-```powershell
-gcloud auth application-default login
-gcloud config set project YOUR_PROJECT_ID
+```yaml
+config:
+  severity: error
+  warn_if: ">0"
+  error_if: ">1000"
+  store_failures: true
 ```
 
-### 2. Census API key (~2 min)
+Thresholds come from the measured baseline. Known drift is 678 rows and warns. A structural break (lost zero-padding, wrong ACS vintage, wrong join key) misses thousands at once and errors.
 
-<https://api.census.gov/data/key_signup.html> — free, instant, arrives by email.
+I checked this by removing the `LPAD` from `stg_election` on purpose. Failures went to 4,624 and the build failed with seven downstream nodes skipped. The first version of this config did not fail: `severity: warn` caps the outcome and makes `error_if` unreachable.
 
-### 3. Election CSV — manual, and it has to be
+| Test | What it protects |
+|---|---|
+| `unique`, `not_null` on `stg_census.county_fips` | The join. A duplicate FIPS fans out and doubles vote totals. |
+| `accepted_values` on `party` | The two-party denominator, if the `WHERE` clause is ever loosened. |
+| `unique`, `not_null` on `county_year_office_key` | The `MERGE`. A bad merge duplicates rows, which looks like plausible data. |
+| `dem_two_party_share_in_range` | Shares outside `[0,1]`, which would mean upstream double-counting. |
+| `census_estimates_not_jammed` | Regression test for the sentinel values above. |
 
-Download **County Presidential Election Returns 2000–2024** from the
-[Harvard Dataverse dataset page](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/VOQCHQ)
-and drop `countypres_2000-2024.csv` into `data/raw/`.
+---
 
-Don't burn time trying to script this — I already did. Dataverse sits behind an
-AWS WAF bot challenge: the REST API, curl, and a plain GET all return an empty
-`202 Accepted` with `x-amzn-waf-action: challenge`. There's no scripted
-download without solving a JS challenge.
+## Idempotency
 
-### 4. Environment
+Loads use `WRITE_TRUNCATE`. Both sources are full snapshots (the Census API returns every county, the MEDSL file contains every year), so there is no incremental subset to load and replacing is simpler. The default `WRITE_APPEND` would double the table on a retry.
+
+The mart is incremental with `unique_key='county_year_office_key'`, so re-runs `MERGE` rather than append. Three consecutive builds:
+
+```
+before:               21,743 rows,  21,743 distinct keys
+after two more runs:  21,743 rows,  21,743 distinct keys
+```
+
+The watermark is `>=` rather than `>` so the newest cycle is reprocessed each run, since that is the one amended after certification. Backfilling an older year needs `--full-refresh`.
+
+---
+
+## Example output
+
+2024 Democratic two-party share by county education quintile:
+
+```
+    Q1  13.4% BA+  ->  26.0% Dem
+    Q5  40.5% BA+  ->  48.0% Dem
+```
+
+Most- and least-educated county quintiles over time:
+
+```
+    2000    44.3% Dem  vs  43.9% Dem
+    2024    48.0% Dem  vs  26.0% Dem
+```
+
+One caveat: this uses a single ACS vintage (2023 5-year) against elections spanning 2000–2024, so demographics are held fixed and only the vote changes. The second table shows how currently high-education counties voted over time, not how counties shifted as they became more educated. Doing that properly would need a matching ACS vintage per election year.
+
+---
+
+## Running it
+
+**Prerequisites.** A billing-enabled GCP project; the free BigQuery sandbox blocks the DML that incremental `MERGE` needs and fails with a permissions error that does not mention billing. A [Census API key](https://api.census.gov/data/key_signup.html), free and instant. The [gcloud CLI](https://cloud.google.com/sdk/docs/install), authenticated with `gcloud auth application-default login`.
+
+**The election CSV is a manual download.** Harvard Dataverse sits behind an AWS WAF bot challenge; the REST API, curl, and a plain GET all return an empty `202 Accepted` with `x-amzn-waf-action: challenge`. Download *County Presidential Election Returns 2000–2024* from [the dataset page](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/VOQCHQ), choosing **Original File Format** rather than the `.tab` ingest, and put it in `data/raw/`. `pipeline/etl.py` looks for it and fails with instructions if it is missing.
 
 ```powershell
-Copy-Item .env.example .env    # fill it in
-Get-Content .env | ForEach-Object { $p = $_ -split '=', 2; [Environment]::SetEnvironmentVariable($p[0], $p[1]) }
-
+Copy-Item .env.example .env    # fill in GCP_PROJECT and CENSUS_API_KEY
+. .\env.ps1                    # dot-sourced, so dbt and Dagster see the vars too
 uv sync --python 3.12
 ```
 
-Verify before writing code — this should succeed on the scaffold as-is:
+Orchestrated:
 
 ```powershell
+uv run dagster dev             # UI with lineage at localhost:3000
+```
+
+or headless:
+
+```powershell
+uv run dagster asset materialize -m pipeline.definitions `
+  --select "raw/raw_county_president,raw/raw_census_acs5,stg_election,stg_census,county_vote_x_demographics"
+```
+
+The two Python loaders run in parallel and `dbt build` waits for both. That edge exists because the assets use `key_prefix="raw"`, which gives them the same asset keys `dagster-dbt` derives from the dbt sources, so no custom translator is needed.
+
+Piecemeal:
+
+```powershell
+uv run python -m pipeline.etl        # extract + load
 cd dbt
-uv run dbt parse
-uv run dbt debug     # confirms BigQuery auth actually works
+uv run dbt build                     # models + tests
+uv run dbt build --full-refresh      # rebuild the incremental mart
 ```
 
 ---
 
-## Working loop
+## Stack notes
 
-```powershell
-cd dbt
-uv run dbt build --select stg_census          # one model
-uv run dbt build                              # everything + tests
-uv run dbt build --full-refresh               # rebuild the incremental mart
-uv run dbt show --select stg_census --limit 5 # eyeball output without leaving the terminal
-```
+Python is pinned to 3.12; dbt and Dagster do not support 3.14. The Census API requires a key on every request and answers unkeyed ones with an HTML "Missing Key" page served as HTTP 200, so a status-code check passes and JSON parsing then fails with an error that says nothing about credentials. MEDSL writes missing values as the string `NA`, which autodetect types as `INT64` and then chokes on; `null_marker="NA"` turns those 89 rows into real NULLs instead of dropping them with `max_bad_records`.
 
-From the repo root: `uv run python -m pipeline.etl` runs extract + load.
-
-The stubs contain `select 1 as replace_me` so the project parses from the
-start — that way `dbt debug` proves your credentials before you've written any
-SQL. Replace those lines entirely.
-
----
-
-## Scope it in two passes
-
-**Saturday — the core, and enough on its own.** TODO 1–7. BigQuery project,
-both CSVs loaded, staging + mart, the tests, a real README. That alone
-legitimately claims BigQuery + dbt + cross-matching + data-quality testing.
-
-**Sunday — the upgrades.** TODO 8 (Dagster), then make the mart incremental
-(TODO 4d) and prove the incremental path with a second election year. This is
-what earns "orchestrated" and "idempotent" honestly.
-
-If Sunday disappears, Saturday still ships. Don't start TODO 8 before TODO 5
-is green.
-
----
-
-## Traps I already hit, so you don't lose hours to them
-
-| Trap | What happens |
-|---|---|
-| **Python 3.14** | dbt and Dagster don't support it. Already pinned to 3.12 in `pyproject.toml` — use `uv run`, not bare `python`. |
-| **Census API without a key** | Silently 302s to an HTML "Missing Key" page, so `json.load()` dies with a parse error that says nothing about credentials. |
-| **BigQuery sandbox** | Incremental `MERGE` fails with a permissions error that doesn't mention billing. Enable billing. |
-| **FIPS leading zeros** | BigQuery autodetect reads FIPS as INT64 and eats the zero. `01001` becomes `1001`, and every Alabama county fails to cross-match. Fix it in dbt, not the loader. |
-| **ACS jam values** | Missing estimates come back as `-666666666`, not NULL. They look like real numbers and quietly poison any average. |
-| **Vote modes** | Some states report a `TOTAL` row *alongside* per-mode rows. A plain `SUM` double-counts those states. See `stg_election.sql` — this is the bug TODO 7's test is aimed at. |
-| **dbt 1.11 test syntax** | Generic test arguments now nest under `arguments:`. Older tutorials show them at the top level; that still runs but warns. |
-| **Dagster asset keys** | dbt source keys are `["raw", "table"]`. A bare `@asset` won't match, and you'll get two disconnected graphs instead of lineage. See TODO 8b. |
-
----
-
-## Be ready to explain these
-
-The build is the means; these are the deliverable.
-
-1. **Why the relationships test warns instead of erroring** — and what number you picked for `error_if`, and why. Have the actual list of flagged geographies from your run.
-2. **Two layers of idempotency** — `WRITE_TRUNCATE` at the load, `MERGE` on a unique key at the mart. Why you need both.
-3. **Why the watermark is `>=` and not `>`** — late-arriving certification amendments, and what `--full-refresh` is for.
-4. **Why the mart joins `INNER`** — you're deliberately trading silent row loss for a clean table, and paying for it with a test.
-5. **Why `dbt build` rather than `run` then `test`.**
-6. **The vintage mismatch** — one ACS 5-year window joined against returns spanning 2000–2024. Naming a limitation of your own dataset unprompted is a strong signal.
-
----
-
-## Checking your work
-
-A complete reference implementation is on the **`reference`** branch.
-
-Use it as a check, not a source. The value of this exercise is entirely in
-having written it yourself — an interviewer will ask *why* you made a choice,
-and reading someone else's answer doesn't get you there.
-
-```powershell
-git diff reference -- dbt/models/staging/stg_census.sql   # after you've written yours
-git show reference:pipeline/etl.py                        # if you're properly stuck
-```
-
-Delete the branch before making the repo public: `git branch -D reference`
+FIPS zero-padding is handled in dbt rather than at load. BigQuery autodetect reads `01001` as the integer `1001`, and the Census API's separate `state` and `county` columns suffer the same fate. `LPAD(CAST(x AS STRING), 5, '0')` is correct whether the column arrives as `INT64` or `STRING`, so the fix lives in one place and cannot drift out of sync with the loader.
 
 ---
 
 ## Data sources
 
-- [MIT Election Data and Science Lab, *County Presidential Election Returns 2000–2024*](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/VOQCHQ) — CC0
-- [U.S. Census Bureau, ACS 5-Year Estimates Detailed Tables](https://www.census.gov/data/developers/data-sets/acs-5year.html) — public domain
-
-Both are public and contain no PII.
+- [MIT Election Data and Science Lab, *County Presidential Election Returns 2000–2024*](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/VOQCHQ), CC0
+- [U.S. Census Bureau, ACS 5-Year Estimates Detailed Tables](https://www.census.gov/data/developers/data-sets/acs-5year.html), public domain

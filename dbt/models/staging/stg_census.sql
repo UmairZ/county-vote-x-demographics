@@ -1,56 +1,52 @@
--- =====================================================================
--- TODO 3 -- stg_census
---
--- Pattern to copy: stg_election.sql (complete, in this folder).
---
--- GRAIN: one row per county. Exactly one.
---
--- COLUMNS TO PRODUCE (names matter -- the mart and the tests use them):
---
---   county_fips              STRING   5 chars. See trap 1.
---   geo_name                 STRING   the ACS `name` column
---   total_population         INT64    from B01003_001E
---   median_household_income  INT64    from B19013_001E
---   median_age               FLOAT64  from B01002_001E
---   pop_25_plus              INT64    from B15003_001E  (education universe)
---   pop_bachelors_plus       INT64    B15003_022E + _023E + _024E + _025E
---                                     (bachelor's, master's, professional, doctorate)
---   pop_race_universe        INT64    from B03002_001E
---   pop_white_nh             INT64    from B03002_003E
---   pop_black_nh             INT64    from B03002_004E
---   pop_hispanic             INT64    from B03002_012E
---
--- Keep raw counts raw. Percentages get derived in the mart, so the
--- transform stays reproducible from the raw layer.
---
--- ---------------------------------------------------------------------
--- TRAP 1 -- the FIPS is split in two, and both halves lose leading zeros.
---
---   The Census API returns `state` and `county` as separate columns
---   ('01' and '001'), and BigQuery autodetect reads both as INT64 -- so
---   they arrive as 1 and 1, not '01' and '001'.
---
---   You need '01001'. Look at how stg_election.sql handles the same
---   problem and apply it to both halves before concatenating.
---
--- TRAP 2 -- ACS does not use NULL for missing data.
---
---   Suppressed or not-applicable estimates come back as negative "jam
---   values" -- -666666666 and friends. Left alone they look like real
---   measurements, and any average you take downstream is silently wrong.
---
---   Null out anything negative. Do it for the three measure columns
---   (population, income, age) -- the count columns are universes and
---   sums, which behave differently.
---
---   Hint: this reads much better as two CTEs -- cast first, then clean --
---   than as one select with the cast repeated inside every guard.
---
--- VERIFY WHEN DONE:
---   dbt build --select stg_census
---   Then in BigQuery:
---     select count(*), count(distinct county_fips) from <dataset>.stg_census;
---   Both numbers should match, and be ~3,222.
--- =====================================================================
+with cast_cols as (
 
-select 1 as replace_me
+    select
+        -- The API returns state and county as separate columns ('01', '001')
+        -- and the load autodetects both as INT64, so both lose their leading
+        -- zeros. Pad each half to its own width before concatenating.
+        concat(
+            lpad(cast(state as string), 2, '0'),
+            lpad(cast(county as string), 3, '0')
+        )                                                     as county_fips,
+        name                                                  as geo_name,
+
+        cast(B01003_001E as int64)                            as total_population,
+        cast(B19013_001E as int64)                            as median_household_income,
+        cast(B01002_001E as float64)                          as median_age,
+
+        cast(B15003_001E as int64)                            as pop_25_plus,
+        cast(B15003_022E as int64) + cast(B15003_023E as int64)
+          + cast(B15003_024E as int64) + cast(B15003_025E as int64)
+                                                              as pop_bachelors_plus,
+
+        cast(B03002_001E as int64)                            as pop_race_universe,
+        cast(B03002_003E as int64)                            as pop_white_nh,
+        cast(B03002_004E as int64)                            as pop_black_nh,
+        cast(B03002_012E as int64)                            as pop_hispanic
+
+    from {{ source('raw', 'raw_census_acs5') }}
+
+)
+
+select
+    county_fips,
+    geo_name,
+
+    -- ACS encodes suppressed and not-applicable estimates as negative
+    -- sentinels (-666666666 and relatives) rather than nulls. Two counties in
+    -- the 2023 vintage carry one, which is enough to move the national average
+    -- county income from $65,047 to -$348,815. Null anything negative, testing
+    -- the property rather than listing known codes.
+    if(total_population        < 0, null, total_population)        as total_population,
+    if(median_household_income < 0, null, median_household_income) as median_household_income,
+    if(median_age              < 0, null, median_age)              as median_age,
+
+    -- Counts and universes are left alone; ACS does not jam these the same way.
+    pop_25_plus,
+    pop_bachelors_plus,
+    pop_race_universe,
+    pop_white_nh,
+    pop_black_nh,
+    pop_hispanic
+
+from cast_cols

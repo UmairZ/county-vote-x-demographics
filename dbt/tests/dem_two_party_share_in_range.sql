@@ -1,25 +1,21 @@
--- =====================================================================
--- TODO 7 -- a singular test
+-- A two-party share outside [0, 1] is arithmetically impossible. It would mean
+-- votes were double-counted upstream or went negative.
 --
--- Generic tests (not_null, unique, relationships) are reusable and live
--- in YAML. A SINGULAR test is just a SQL file that selects the rows that
--- should not exist. If it returns zero rows it passes. That is the whole
--- contract.
+-- Aimed specifically at the vote-mode collapse in stg_election: 1,514
+-- county-year-party groups report a TOTAL row and the per-mode rows that sum
+-- to it. If that CASE expression is ever simplified to a plain SUM, those
+-- groups double and this fires.
 --
--- Write a query against ref('county_vote_x_demographics') that returns
--- any row where dem_two_party_share is null, below 0, or above 1.
---
--- Select enough columns to actually debug it -- the key, dem_votes,
--- rep_votes, and the share itself. A test that tells you something is
--- wrong without telling you what is half a test.
---
--- WHAT THIS ACTUALLY CATCHES:
---   A share above 1 means votes were double-counted upstream -- which is
---   precisely the TOTAL-vs-per-mode trap that stg_election.sql handles.
---   If someone "simplifies" that CASE expression into a plain SUM, this
---   test is what fires. Read the comment in stg_election.sql to see the
---   bug this is aimed at.
--- =====================================================================
+-- Selects the vote columns too, not just the key, so a failure says what went
+-- wrong rather than only that something did.
 
-select 1 as replace_me
-where false
+select
+    county_year_office_key,
+    dem_votes,
+    rep_votes,
+    two_party_votes,
+    dem_two_party_share
+from {{ ref('county_vote_x_demographics') }}
+where dem_two_party_share is null
+   or dem_two_party_share < 0
+   or dem_two_party_share > 1
