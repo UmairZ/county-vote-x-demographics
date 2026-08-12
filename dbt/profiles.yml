@@ -1,0 +1,14 @@
+# dbt reads profiles.yml from the current working directory, so run dbt from ./dbt.
+# Auth is gcloud Application Default Credentials: `gcloud auth application-default login`.
+county_vote_x_demographics:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('GCP_PROJECT') }}"
+      dataset: "{{ env_var('BQ_DATASET', 'elections') }}"
+      location: "{{ env_var('BQ_LOCATION', 'US') }}"
+      threads: 4
+      job_execution_timeout_seconds: 300
+      job_retries: 1

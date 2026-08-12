@@ -1,0 +1,31 @@
+version: 2
+
+models:
+  - name: county_vote_x_demographics
+    description: >
+      Foundational cross-matched dataset: county-level two-party presidential
+      vote joined to ACS 5-year demographics on 5-digit county FIPS.
+    columns:
+      - name: county_year_office_key
+        description: Grain of the table, and the incremental unique_key.
+        # TODO 6a: not_null AND unique.
+        #
+        # This pair is the guard on your incremental model. If the MERGE
+        # is misconfigured -- wrong unique_key, or unique_key omitted so
+        # dbt falls back to append -- the symptom is duplicated rows and
+        # doubled vote totals, which looks like plausible data. `unique`
+        # turns that into a loud failure instead.
+        data_tests: []
+
+      - name: county_fips
+        # TODO 6b: not_null.
+        data_tests: []
+
+      - name: total_population
+        description: Null here would mean a cross-matched row carrying no ACS data.
+        # TODO 6c: not_null.
+        #
+        # With an inner join this should be structurally impossible --
+        # which is the point. If it ever fires, your join logic changed
+        # underneath you.
+        data_tests: []

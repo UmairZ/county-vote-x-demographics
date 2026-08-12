@@ -1,0 +1,116 @@
+version: 2
+
+# ---------------------------------------------------------------------
+# Sources are done for you -- this is wiring, not learning. Note that
+# database/schema come from env vars so the repo carries no project ID.
+# ---------------------------------------------------------------------
+sources:
+  - name: raw
+    database: "{{ env_var('GCP_PROJECT') }}"
+    schema: "{{ env_var('BQ_DATASET', 'elections') }}"
+    tables:
+      - name: raw_county_president
+        description: >
+          MIT Election Data and Science Lab, County Presidential Election
+          Returns 2000-2024 (CC0). Loaded WRITE_TRUNCATE from a manual
+          Dataverse download.
+      - name: raw_census_acs5
+        description: >
+          Census ACS 5-year county-level detail tables, pulled from the
+          Census Data API by pipeline/etl.py.
+
+# =====================================================================
+# TODO 5 -- the tests.  THIS IS THE MOST IMPORTANT FILE IN THE REPO.
+#
+# The join is a day's work. The tests around the join are what you get
+# asked about. Do not rush this one.
+#
+# dbt syntax reminder (dbt 1.11): generic test arguments nest under an
+# `arguments:` key. `config:` sits as a sibling of `arguments:`, not
+# inside it. Older tutorials show both at the top level -- that still
+# runs but emits a deprecation warning.
+#
+#   columns:
+#     - name: some_column
+#       data_tests:
+#         - some_test:
+#             arguments:
+#               key: value
+#             config:
+#               severity: warn
+# =====================================================================
+
+models:
+  - name: stg_election
+    description: >
+      One row per county-year-office-party, two-party only, FIPS zero-padded
+      to 5 characters and vote modes collapsed without double-counting.
+    columns:
+      - name: county_fips
+        description: 5-character county FIPS, the cross-match key.
+        # TODO 5a: not_null.
+        #
+        # TODO 5b: THE CROSS-MATCH QUALITY GATE. Build this one carefully.
+        #
+        #   Use the built-in `relationships` test to assert that every
+        #   county_fips appearing in stg_election also exists in
+        #   stg_census. It takes two arguments: `to` (a ref) and `field`.
+        #
+        #   It WILL flag rows. That is the feature, not a bug. What it
+        #   finds is real geographic drift:
+        #
+        #     Alaska      returns are reported by state house district
+        #                 under pseudo-FIPS, not by borough
+        #     Connecticut counties were replaced by nine planning regions
+        #                 in ACS 2022+; older returns carry old county FIPS
+        #     Virginia    38 independent cities hold their own FIPS,
+        #                 separate from the county surrounding them
+        #     Renames     e.g. Oglala Lakota County SD is 46102, and was
+        #                 Shannon County 46113 until 2015
+        #
+        #   NOW THE DESIGN DECISION -- think before you write it:
+        #
+        #   A test that is permanently red teaches everyone to ignore it.
+        #   A test that is deleted because it was annoying catches nothing.
+        #   You want a third thing: a test that distinguishes "geography
+        #   is inherently messy" from "the join is actually broken."
+        #
+        #   Look up dbt's `severity`, `warn_if` and `error_if` configs.
+        #   Set it so a handful of known-oddball geographies warns, but a
+        #   structural break -- wrong ACS vintage, un-padded FIPS, wrong
+        #   join key -- errors. Any of those breaks misses hundreds of
+        #   rows instantly, so there is a wide gap to put a threshold in.
+        #
+        #   Pick your threshold deliberately and be ready to defend the
+        #   number. "Around fifty, because real drift is a dozen or two
+        #   and a broken join is four figures" is a good answer.
+        #
+        # AFTER IT RUNS: query the failures and write the actual list into
+        # your README. dbt prints the table holding them. The specific
+        # geographies you flagged are the interview story -- being able to
+        # say "my test caught Connecticut's planning-region switch" is
+        # worth more than any amount of pipeline code.
+        data_tests: []
+
+      - name: election_year
+        # TODO 5c: not_null.
+        data_tests: []
+
+      - name: party
+        # TODO 5d: accepted_values, limited to DEMOCRAT and REPUBLICAN.
+        # stg_election already filters to those two, so this test is
+        # guarding the filter itself -- if someone loosens the WHERE
+        # clause later, this fires.
+        data_tests: []
+
+  - name: stg_census
+    description: ACS 5-year county demographics, one row per county.
+    columns:
+      - name: county_fips
+        description: 5-character county FIPS, the cross-match key.
+        # TODO 5e: not_null AND unique.
+        #
+        # unique is doing real work here: it proves your grain claim. If
+        # stg_census has duplicate FIPS, the mart's inner join fans out
+        # and every vote total silently doubles. Cheaper to catch here.
+        data_tests: []

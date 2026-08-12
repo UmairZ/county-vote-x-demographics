@@ -1,0 +1,14 @@
+name: county_vote_x_demographics
+version: "1.0.0"
+profile: county_vote_x_demographics
+
+model-paths: ["models"]
+test-paths: ["tests"]
+target-path: "target"
+
+models:
+  county_vote_x_demographics:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

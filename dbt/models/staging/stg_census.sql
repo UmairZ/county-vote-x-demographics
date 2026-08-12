@@ -1,0 +1,56 @@
+-- =====================================================================
+-- TODO 3 -- stg_census
+--
+-- Pattern to copy: stg_election.sql (complete, in this folder).
+--
+-- GRAIN: one row per county. Exactly one.
+--
+-- COLUMNS TO PRODUCE (names matter -- the mart and the tests use them):
+--
+--   county_fips              STRING   5 chars. See trap 1.
+--   geo_name                 STRING   the ACS `name` column
+--   total_population         INT64    from B01003_001E
+--   median_household_income  INT64    from B19013_001E
+--   median_age               FLOAT64  from B01002_001E
+--   pop_25_plus              INT64    from B15003_001E  (education universe)
+--   pop_bachelors_plus       INT64    B15003_022E + _023E + _024E + _025E
+--                                     (bachelor's, master's, professional, doctorate)
+--   pop_race_universe        INT64    from B03002_001E
+--   pop_white_nh             INT64    from B03002_003E
+--   pop_black_nh             INT64    from B03002_004E
+--   pop_hispanic             INT64    from B03002_012E
+--
+-- Keep raw counts raw. Percentages get derived in the mart, so the
+-- transform stays reproducible from the raw layer.
+--
+-- ---------------------------------------------------------------------
+-- TRAP 1 -- the FIPS is split in two, and both halves lose leading zeros.
+--
+--   The Census API returns `state` and `county` as separate columns
+--   ('01' and '001'), and BigQuery autodetect reads both as INT64 -- so
+--   they arrive as 1 and 1, not '01' and '001'.
+--
+--   You need '01001'. Look at how stg_election.sql handles the same
+--   problem and apply it to both halves before concatenating.
+--
+-- TRAP 2 -- ACS does not use NULL for missing data.
+--
+--   Suppressed or not-applicable estimates come back as negative "jam
+--   values" -- -666666666 and friends. Left alone they look like real
+--   measurements, and any average you take downstream is silently wrong.
+--
+--   Null out anything negative. Do it for the three measure columns
+--   (population, income, age) -- the count columns are universes and
+--   sums, which behave differently.
+--
+--   Hint: this reads much better as two CTEs -- cast first, then clean --
+--   than as one select with the cast repeated inside every guard.
+--
+-- VERIFY WHEN DONE:
+--   dbt build --select stg_census
+--   Then in BigQuery:
+--     select count(*), count(distinct county_fips) from <dataset>.stg_census;
+--   Both numbers should match, and be ~3,222.
+-- =====================================================================
+
+select 1 as replace_me
